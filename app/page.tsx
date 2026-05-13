@@ -1,6 +1,15 @@
 "use client";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { applyPipeline, defaults, Settings } from "./lib/process";
+import { aiDefaults, aiEnhance, AiOpts } from "./lib/ai";
+import {
+  neuralDefaults,
+  neuralEnhance,
+  NEURAL_MODELS,
+  NeuralOpts,
+  NeuralModelId,
+} from "./lib/neural";
+import CompareSlider from "./components/CompareSlider";
 
 type Range = { key: keyof Settings; label: string; min: number; max: number; step: number };
 
@@ -28,18 +37,41 @@ const COLOR: Range[] = [
   { key: "vibrance", label: "Canlılık (Vibrance)", min: -1, max: 1, step: 0.02 },
 ];
 
+type Mode = "algorithmic" | "neural";
+
+// Light polish after neural SR: small CAS-like sharpen + vibrance via existing pipeline.
+const POLISH: Settings = {
+  ...defaults,
+  sharpAmount: 0.6, sharpRadius: 1.0, sharpThreshold: 2, sharpPasses: 1,
+  clarity: 0.15, shadows: 0.08, highlights: -0.03, vibrance: 0.15,
+};
+
 export default function Page() {
   const [settings, setSettings] = useState<Settings>(defaults);
+  const [aiOpts, setAiOpts] = useState<AiOpts>(aiDefaults);
+  const [neuralOpts, setNeuralOpts] = useState<NeuralOpts>(neuralDefaults);
+  const [mode, setMode] = useState<Mode>("neural");
+  const [neuralPolish, setNeuralPolish] = useState(true);
   const [filename, setFilename] = useState<string>("");
   const [busy, setBusy] = useState(false);
   const [hasImage, setHasImage] = useState(false);
+  const [aiBusy, setAiBusy] = useState(false);
+  const [aiStage, setAiStage] = useState<string>("");
+  const [aiPct, setAiPct] = useState<number>(0);
+  const [beforeData, setBeforeData] = useState<ImageData | null>(null);
+  const [afterData, setAfterData] = useState<ImageData | null>(null);
+  const [showCompare, setShowCompare] = useState(false);
 
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const sourceRef = useRef<ImageData | null>(null);
+  const originalRef = useRef<ImageData | null>(null);
   const rafRef = useRef<number | null>(null);
 
   const onFile = useCallback((file: File) => {
     setFilename(file.name);
+    setShowCompare(false);
+    setBeforeData(null);
+    setAfterData(null);
     const img = new Image();
     img.onload = () => {
       const max = 2400;
@@ -52,7 +84,9 @@ export default function Page() {
       c.width = w; c.height = h;
       const ctx = c.getContext("2d")!;
       ctx.drawImage(img, 0, 0, w, h);
-      sourceRef.current = ctx.getImageData(0, 0, w, h);
+      const id = ctx.getImageData(0, 0, w, h);
+      sourceRef.current = id;
+      originalRef.current = new ImageData(new Uint8ClampedArray(id.data), w, h);
       const out = canvasRef.current!;
       out.width = w; out.height = h;
       setHasImage(true);
@@ -66,15 +100,69 @@ export default function Page() {
       if (!sourceRef.current || !canvasRef.current) return;
       setBusy(true);
       const out = applyPipeline(sourceRef.current, settings);
-      canvasRef.current.getContext("2d")!.putImageData(out, 0, 0);
+      const cnv = canvasRef.current;
+      if (cnv.width !== out.width || cnv.height !== out.height) {
+        cnv.width = out.width; cnv.height = out.height;
+      }
+      cnv.getContext("2d")!.putImageData(out, 0, 0);
       setBusy(false);
     });
   }, [settings]);
 
-  useEffect(() => { if (hasImage) schedule(); }, [settings, hasImage, schedule]);
+  useEffect(() => { if (hasImage && !showCompare) schedule(); }, [settings, hasImage, schedule, showCompare]);
 
-  const update = (k: keyof Settings, v: number) =>
-    setSettings((s) => ({ ...s, [k]: v }));
+  const runAi = async () => {
+    if (!originalRef.current) return;
+    setAiBusy(true); setAiPct(0); setAiStage("hazırlanıyor");
+    try {
+      let result: ImageData;
+      if (mode === "neural") {
+        result = await neuralEnhance(originalRef.current, neuralOpts, (stage, pct) => {
+          setAiStage(stage); setAiPct(Math.round(pct));
+        });
+        if (neuralPolish) {
+          setAiStage("post-polish"); setAiPct(99);
+          result = applyPipeline(result, POLISH);
+        }
+      } else {
+        result = await aiEnhance(originalRef.current, aiOpts, (stage, pct) => {
+          setAiStage(stage); setAiPct(Math.round(pct));
+        });
+      }
+      sourceRef.current = result;
+      setBeforeData(originalRef.current);
+      setAfterData(result);
+      setShowCompare(true);
+      const cnv = canvasRef.current!;
+      cnv.width = result.width; cnv.height = result.height;
+      cnv.getContext("2d")!.putImageData(result, 0, 0);
+      setAiPct(100); setAiStage("bitti");
+    } catch (e: any) {
+      console.error(e);
+      setAiStage("hata: " + (e?.message || "bilinmeyen"));
+    } finally {
+      setAiBusy(false);
+    }
+  };
+
+  const revertToOriginal = () => {
+    if (!originalRef.current) return;
+    sourceRef.current = new ImageData(
+      new Uint8ClampedArray(originalRef.current.data),
+      originalRef.current.width,
+      originalRef.current.height
+    );
+    setShowCompare(false);
+    setBeforeData(null);
+    setAfterData(null);
+    setSettings(defaults);
+    schedule();
+  };
+
+  const update = (k: keyof Settings, v: number) => setSettings((s) => ({ ...s, [k]: v }));
+  const updateAi = (k: keyof AiOpts, v: number | boolean) => setAiOpts((s) => ({ ...s, [k]: v }));
+  const updateNeural = <K extends keyof NeuralOpts>(k: K, v: NeuralOpts[K]) =>
+    setNeuralOpts((s) => ({ ...s, [k]: v }));
 
   const download = () => {
     if (!canvasRef.current) return;
@@ -107,17 +195,25 @@ export default function Page() {
     );
   };
 
+  const selectedModel = NEURAL_MODELS.find((m) => m.id === neuralOpts.modelId) ?? NEURAL_MODELS[0];
+
   return (
     <div className="app">
       <div className="canvasWrap">
-        {!hasImage && <div className="hint">Resim yükle → netleştir, ışığı ayarla, indir.</div>}
-        <canvas ref={canvasRef} style={{ display: hasImage ? "block" : "none" }} />
+        {!hasImage && <div className="hint">Resim yükle → AI ile netleştir → karşılaştır → indir.</div>}
+        <canvas
+          ref={canvasRef}
+          style={{ display: hasImage && !showCompare ? "block" : "none" }}
+        />
+        {hasImage && showCompare && beforeData && afterData && (
+          <CompareSlider beforeData={beforeData} afterData={afterData} />
+        )}
       </div>
 
       <div className="panel">
         <div className="header">
           <h2>Lightss</h2>
-          <span className="tag">{busy ? "işleniyor…" : "hazır"}</span>
+          <span className="tag">{aiBusy ? "AI işliyor…" : busy ? "işleniyor…" : "hazır"}</span>
         </div>
 
         <div className="btns">
@@ -132,23 +228,149 @@ export default function Page() {
           <button className="primary" onClick={download} disabled={!hasImage}>İndir PNG</button>
         </div>
 
-        <h3>Netleştirme</h3>
-        {SHARP.map(renderSlider)}
-        <div className="hint">
-          Algoritma: YCbCr luminance kanalında iteratif Unsharp Mask. Renk kaymaz, genel parlaklık düşmez.
+        <div className="modeTabs">
+          <button
+            className={mode === "neural" ? "tab active" : "tab"}
+            onClick={() => setMode("neural")}
+          >Neural (AI Model)</button>
+          <button
+            className={mode === "algorithmic" ? "tab active" : "tab"}
+            onClick={() => setMode("algorithmic")}
+          >Algoritmik (hızlı)</button>
         </div>
+
+        <button
+          className="aiBtn"
+          onClick={runAi}
+          disabled={!hasImage || aiBusy}
+          title={mode === "neural"
+            ? "Swin2SR ONNX modeli tarayıcıda çalışır. İlk seferde model indirilir."
+            : "Bilateral + Lanczos + CAS + CLAHE + Clarity + Vibrance"}
+        >
+          {aiBusy
+            ? `${aiStage} — %${aiPct}`
+            : mode === "neural" ? "AI NETLEŞTİR (NEURAL)" : "AI NETLEŞTİR"}
+        </button>
+        {aiBusy && (
+          <div className="progress"><div style={{ width: `${aiPct}%` }} /></div>
+        )}
+
+        {hasImage && (beforeData && afterData) && (
+          <div className="btns">
+            <button onClick={() => setShowCompare((s) => !s)}>
+              {showCompare ? "Karşılaştırmayı Gizle" : "Karşılaştır"}
+            </button>
+            <button onClick={revertToOriginal}>Orijinale Dön</button>
+          </div>
+        )}
+
+        {mode === "neural" ? (
+          <>
+            <h3>Neural Ayarları</h3>
+            <div className="row">
+              <label><span>Model</span><span className="dim">{selectedModel.scale}x · ~{selectedModel.approxSizeMB}MB</span></label>
+              <select
+                value={neuralOpts.modelId}
+                onChange={(e) => updateNeural("modelId", e.target.value as NeuralModelId)}
+                disabled={aiBusy}
+              >
+                {NEURAL_MODELS.map((m) => (
+                  <option key={m.id} value={m.id}>{m.label}</option>
+                ))}
+              </select>
+              <div className="hint">{selectedModel.desc}</div>
+            </div>
+
+            <div className="row">
+              <label>
+                <span>Maks. girdi (uzun kenar)</span>
+                <span>{neuralOpts.maxInput} px</span>
+              </label>
+              <input
+                type="range" min={256} max={1536} step={64}
+                value={neuralOpts.maxInput}
+                onChange={(e) => updateNeural("maxInput", parseInt(e.target.value))}
+                disabled={aiBusy}
+              />
+              <div className="hint">Büyük girdi = daha çok detay ama daha çok RAM ve süre. 512-768 tatlı nokta.</div>
+            </div>
+
+            <div className="row">
+              <label>
+                <span>Tile boyutu</span>
+                <span>{neuralOpts.tileSize > 0 ? `${neuralOpts.tileSize} px` : "tek seferde"}</span>
+              </label>
+              <input
+                type="range" min={0} max={384} step={32}
+                value={neuralOpts.tileSize}
+                onChange={(e) => updateNeural("tileSize", parseInt(e.target.value))}
+                disabled={aiBusy}
+              />
+              <div className="hint">0 = tek seferde (küçük resim). Büyükler için 128-256.</div>
+            </div>
+
+            <div className="row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={neuralPolish}
+                  onChange={(e) => setNeuralPolish(e.target.checked)}
+                  disabled={aiBusy}
+                />
+                <span>Sonrası polish (hafif sharpen + vibrance)</span>
+              </label>
+            </div>
+          </>
+        ) : (
+          <>
+            <h3>Algoritmik Ayarlar</h3>
+            <div className="row">
+              <label className="check">
+                <input
+                  type="checkbox"
+                  checked={aiOpts.upscale}
+                  onChange={(e) => updateAi("upscale", e.target.checked)}
+                />
+                <span>2x Büyüt (Lanczos)</span>
+              </label>
+            </div>
+            {([
+              { key: "denoise", label: "Gürültü temizle (Bilateral)" },
+              { key: "sharpen", label: "Sharpen (CAS)" },
+              { key: "clarity", label: "Clarity" },
+              { key: "autoExposure", label: "Oto pozlama (CLAHE)" },
+              { key: "vibrance", label: "Vibrance" },
+            ] as { key: keyof AiOpts; label: string }[]).map((r) => {
+              const v = aiOpts[r.key] as number;
+              return (
+                <div className="row" key={r.key}>
+                  <label>
+                    <span>{r.label}</span>
+                    <span>{v.toFixed(2)}</span>
+                  </label>
+                  <input
+                    type="range" min={0} max={1} step={0.02}
+                    value={v}
+                    onChange={(e) => updateAi(r.key, parseFloat(e.target.value))}
+                  />
+                </div>
+              );
+            })}
+          </>
+        )}
+
+        <h3>Netleştirme (manuel)</h3>
+        {SHARP.map(renderSlider)}
 
         <h3>Işık</h3>
         {LIGHT.map(renderSlider)}
-        <div className="hint">
-          Gölgeleri Aç → karartmadan detay açar. Pozlama linear çarpan, gamma orta tonlar.
-        </div>
 
         <h3>Renk</h3>
         {COLOR.map(renderSlider)}
 
         <div className="hint">
-          Tüm işlem tarayıcıda. Görsel sunucuya gitmez. Vercel'de statik olarak çalışır.
+          Tüm işlem tarayıcıda. Neural model dosyası HuggingFace CDN'inden indirilir, tarayıcı önbelleğine alınır.
+          Görsel sunucuya gitmez.
         </div>
       </div>
     </div>
