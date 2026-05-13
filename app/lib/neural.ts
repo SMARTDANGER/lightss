@@ -18,25 +18,25 @@ export type NeuralModelInfo = {
 
 export const NEURAL_MODELS: NeuralModelInfo[] = [
   {
-    id: "Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
-    label: "Real-world 4x (önerilen)",
-    scale: 4,
-    approxSizeMB: 24,
-    desc: "Bulanık telefon fotoğrafları için BSRGAN eğitimli, en güçlü.",
+    id: "Xenova/swin2SR-classical-sr-x2-64",
+    label: "Klasik 2x (hızlı, önerilen)",
+    scale: 2,
+    approxSizeMB: 13,
+    desc: "Hızlı, hafif. Tarayıcıda donmadan çalışır. Genel amaç.",
   },
   {
     id: "Xenova/swin2SR-compressed-sr-x4-48",
     label: "Sıkıştırılmış 4x",
     scale: 4,
     approxSizeMB: 12,
-    desc: "JPEG artefakt + düşük kalite fotoğraflar için.",
+    desc: "JPEG artefakt + düşük kalite. 4x büyütür, daha yavaş.",
   },
   {
-    id: "Xenova/swin2SR-classical-sr-x2-64",
-    label: "Klasik 2x (hızlı)",
-    scale: 2,
-    approxSizeMB: 13,
-    desc: "Hızlı, hafif. Genel amaç.",
+    id: "Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
+    label: "Real-world 4x (en güçlü, yavaş)",
+    scale: 4,
+    approxSizeMB: 24,
+    desc: "Bulanık telefon fotoğrafları için BSRGAN eğitimli. WebGPU önerilir.",
   },
 ];
 
@@ -55,7 +55,19 @@ async function loadTransformers() {
   _trans = await import(/* webpackIgnore: true */ TRANSFORMERS_CDN);
   _trans.env.allowLocalModels = false;
   _trans.env.allowRemoteModels = true;
+  // Off-main-thread inference so UI never freezes.
+  // proxy: run ONNX session in a dedicated Web Worker.
+  // numThreads=1 avoids SharedArrayBuffer requirement (no COOP/COEP needed on Vercel).
+  try {
+    _trans.env.backends.onnx.wasm.proxy = true;
+    _trans.env.backends.onnx.wasm.numThreads = 1;
+  } catch {}
   return _trans;
+}
+
+function pickDevice(): "webgpu" | "wasm" {
+  if (typeof navigator !== "undefined" && (navigator as any).gpu) return "webgpu";
+  return "wasm";
 }
 
 export async function getNeuralPipe(modelId: NeuralModelId, onProg?: (pct: number) => void) {
@@ -66,14 +78,27 @@ export async function getNeuralPipe(modelId: NeuralModelId, onProg?: (pct: numbe
 
   const p = (async () => {
     const t = await loadTransformers();
-    const pipe = await t.pipeline("image-to-image", modelId, {
+    const device = pickDevice();
+    const baseOpts: any = {
       progress_callback: (info: any) => {
         if (info.status === "progress" && info.total) {
           const pct = (info.loaded / info.total) * 100;
           onProg?.(Math.max(0, Math.min(100, pct)));
         }
       },
-    });
+    };
+    let pipe;
+    try {
+      pipe = await t.pipeline("image-to-image", modelId, {
+        ...baseOpts,
+        device,
+        dtype: device === "webgpu" ? "fp16" : "fp32",
+      });
+    } catch (err) {
+      // fallback to wasm if webgpu init failed
+      console.warn("[neural] webgpu failed, fallback to wasm", err);
+      pipe = await t.pipeline("image-to-image", modelId, baseOpts);
+    }
     _pipes.set(modelId, pipe);
     _loading.delete(modelId);
     return pipe;
@@ -183,10 +208,10 @@ export type NeuralOpts = {
 };
 
 export const neuralDefaults: NeuralOpts = {
-  modelId: "Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr",
-  maxInput: 768,
-  tileSize: 192,
-  overlap: 24,
+  modelId: "Xenova/swin2SR-classical-sr-x2-64",
+  maxInput: 512,
+  tileSize: 128,
+  overlap: 16,
 };
 
 export async function neuralEnhance(
