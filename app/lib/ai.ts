@@ -5,6 +5,7 @@
 
 export type AiOpts = {
   upscale: boolean;       // 2x Lanczos
+  deblur: number;         // 0..1   Richardson-Lucy strength (iterations + sigma)
   denoise: number;        // 0..1   bilateral strength
   sharpen: number;        // 0..1   CAS strength
   clarity: number;        // 0..1   wide-radius local contrast on Y
@@ -14,9 +15,10 @@ export type AiOpts = {
 
 export const aiDefaults: AiOpts = {
   upscale: true,
-  denoise: 0.35,
-  sharpen: 0.85,
-  clarity: 0.45,
+  deblur: 0.6,
+  denoise: 0.25,
+  sharpen: 0.9,
+  clarity: 0.5,
   autoExposure: 0.35,
   vibrance: 0.25,
 };
@@ -293,6 +295,39 @@ function gauss1D(src: Float32Array, w: number, h: number, radius: number): Float
   return out;
 }
 
+// ---------- Richardson-Lucy deconvolution (real deblur) ----------
+// Inverts a known Gaussian PSF iteratively. For unknown blur we assume
+// symmetric Gaussian with given sigma. 10-20 iterations recover heavy blur.
+// PSF is symmetric → flipped = original → reuse the same gauss1D for both
+// the forward blur and the back-projection.
+export function richardsonLucyY(
+  Y: Float32Array, w: number, h: number, sigma: number, iterations: number
+) {
+  if (iterations < 1) return;
+  const observed = new Float32Array(Y);
+  // initial estimate = observed
+  const estimate = new Float32Array(Y);
+  const ratio = new Float32Array(Y.length);
+
+  for (let it = 0; it < iterations; it++) {
+    const reblurred = gauss1D(estimate, w, h, sigma);
+    for (let i = 0; i < Y.length; i++) {
+      const denom = reblurred[i];
+      ratio[i] = denom > 0.5 ? observed[i] / denom : 1;
+      if (ratio[i] > 4) ratio[i] = 4;   // damping to prevent ringing
+      if (ratio[i] < 0.25) ratio[i] = 0.25;
+    }
+    const correction = gauss1D(ratio, w, h, sigma);
+    for (let i = 0; i < Y.length; i++) {
+      let v = estimate[i] * correction[i];
+      if (v < 0) v = 0; else if (v > 255) v = 255;
+      estimate[i] = v;
+    }
+  }
+
+  for (let i = 0; i < Y.length; i++) Y[i] = estimate[i];
+}
+
 // ---------- clarity (wide-radius local contrast) ----------
 function clarityYpass(Y: Float32Array, w: number, h: number, amount: number) {
   if (amount <= 0.001) return;
@@ -344,19 +379,30 @@ export async function aiEnhance(src: ImageData, opts: AiOpts, onProg?: Progress)
   let { Y, Cb, Cr } = splitYCbCr(out.data);
 
   if (opts.denoise > 0.001) {
-    onProg?.("bilateral denoise", 45);
+    onProg?.("bilateral denoise", 40);
     await yieldUI();
     const sigmaS = 2.0;
     const sigmaR = 8 + opts.denoise * 22;   // 8..30
     Y = bilateralY(Y, w, h, sigmaS, sigmaR);
   }
 
-  if (opts.sharpen > 0.001) {
-    onProg?.("CAS sharpen", 65);
+  if (opts.deblur > 0.001) {
+    // sigma: 1..3.5 (heavier blur assumed for higher strength)
+    // iterations: 4..24 (more = stronger recovery + more ringing risk)
+    const sigma = 0.8 + opts.deblur * 2.7;
+    const iters = Math.round(4 + opts.deblur * 20);
+    onProg?.(`deblur (RL ${iters}× σ${sigma.toFixed(1)})`, 55);
     await yieldUI();
+    richardsonLucyY(Y, w, h, sigma, iters);
+  }
+
+  if (opts.sharpen > 0.001) {
+    onProg?.("CAS sharpen", 72);
+    await yieldUI();
+    // cascade: 3 passes with decreasing strength → stronger snap on blurry source
     casY(Y, w, h, opts.sharpen);
-    // second light pass for stronger snap
-    if (opts.sharpen > 0.5) casY(Y, w, h, opts.sharpen * 0.5);
+    if (opts.sharpen > 0.4) casY(Y, w, h, opts.sharpen * 0.6);
+    if (opts.sharpen > 0.7) casY(Y, w, h, opts.sharpen * 0.35);
   }
 
   if (opts.autoExposure > 0.001) {

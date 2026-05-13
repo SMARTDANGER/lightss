@@ -50,7 +50,7 @@ export default function Page() {
   const [settings, setSettings] = useState<Settings>(defaults);
   const [aiOpts, setAiOpts] = useState<AiOpts>(aiDefaults);
   const [neuralOpts, setNeuralOpts] = useState<NeuralOpts>(neuralDefaults);
-  const [mode, setMode] = useState<Mode>("neural");
+  const [mode, setMode] = useState<Mode>("algorithmic");
   const [neuralPolish, setNeuralPolish] = useState(true);
   const [filename, setFilename] = useState<string>("");
   const [busy, setBusy] = useState(false);
@@ -230,13 +230,18 @@ export default function Page() {
 
         <div className="modeTabs">
           <button
-            className={mode === "neural" ? "tab active" : "tab"}
-            onClick={() => setMode("neural")}
-          >Neural (AI Model)</button>
-          <button
             className={mode === "algorithmic" ? "tab active" : "tab"}
             onClick={() => setMode("algorithmic")}
-          >Algoritmik (hızlı)</button>
+          >Deblur + Sharpen</button>
+          <button
+            className={mode === "neural" ? "tab active" : "tab"}
+            onClick={() => setMode("neural")}
+          >Neural SR (2x/4x)</button>
+        </div>
+        <div className="hint">
+          {mode === "algorithmic"
+            ? "Bulanık fotoğraflar için: Richardson-Lucy deconvolution + cascade CAS sharpen. Gerçek deblur."
+            : "Düşük çözünürlük için: Swin2SR super-resolution modeli. Detay ekler ama blur'u açmaz."}
         </div>
 
         <button
@@ -335,8 +340,9 @@ export default function Page() {
               </label>
             </div>
             {([
+              { key: "deblur", label: "Deblur (Richardson-Lucy)" },
               { key: "denoise", label: "Gürültü temizle (Bilateral)" },
-              { key: "sharpen", label: "Sharpen (CAS)" },
+              { key: "sharpen", label: "Sharpen (CAS, cascade)" },
               { key: "clarity", label: "Clarity" },
               { key: "autoExposure", label: "Oto pozlama (CLAHE)" },
               { key: "vibrance", label: "Vibrance" },
