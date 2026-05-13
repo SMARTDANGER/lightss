@@ -179,15 +179,9 @@ export function autoTuneAi(stats: ImageStats): AiOpts {
 
 export function autoTuneNeural(stats: ImageStats): NeuralOpts {
   const long = stats.longSide;
-  const hasWebGPU = typeof navigator !== "undefined" && !!(navigator as any).gpu;
-
-  // model is fixed (Swin2SR real-world 4x). Tune only inference params.
-  // maxInput: smaller for wasm to fit RAM, bigger for WebGPU.
-  let maxInput: number;
-  if (hasWebGPU) maxInput = Math.min(long, 768);
-  else           maxInput = Math.min(long, 384);
-
-  const tileSize = long <= 256 ? 0 : hasWebGPU ? 192 : 128;
+  // wasm-only. Conservative defaults to fit memory and keep tile latency low.
+  const maxInput = Math.min(long, 384);
+  const tileSize = long <= 256 ? 0 : 128;
   const overlap = tileSize > 0 ? Math.max(8, Math.round(tileSize * 0.12)) : 0;
 
   return {
