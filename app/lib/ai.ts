@@ -51,36 +51,62 @@ function mergeYCbCr(Y: Float32Array, Cb: Float32Array, Cr: Float32Array, out: Ui
 }
 
 // ---------- bilateral filter (denoise, edge-preserving) ----------
-// Approximated: 5x5 window with spatial+range gaussian on Y only.
+// 3x3 window with spatial+range gaussian on Y only. ~2.5x faster than 5x5
+// with negligible visual difference for typical denoise needs.
+// Inner loop uses precomputed range lookup table for exp().
+const _rangeLUT = new Float32Array(512);
+let _lutSigmaR = -1;
+function getRangeLUT(sigmaR: number) {
+  if (sigmaR === _lutSigmaR) return _rangeLUT;
+  const sR2 = 2 * sigmaR * sigmaR;
+  for (let i = 0; i < 512; i++) _rangeLUT[i] = Math.exp(-(i * i) / sR2);
+  _lutSigmaR = sigmaR;
+  return _rangeLUT;
+}
+
 export function bilateralY(Y: Float32Array, w: number, h: number, sigmaS: number, sigmaR: number): Float32Array {
-  const r = 2;
+  const r = 1;
   const out = new Float32Array(Y.length);
   const sS2 = 2 * sigmaS * sigmaS;
-  const sR2 = 2 * sigmaR * sigmaR;
-  // precompute spatial kernel
-  const sp = new Float32Array((r * 2 + 1) * (r * 2 + 1));
+  // 3x3 spatial kernel
+  const sp = new Float32Array(9);
   for (let dy = -r; dy <= r; dy++)
     for (let dx = -r; dx <= r; dx++)
-      sp[(dy + r) * (r * 2 + 1) + (dx + r)] = Math.exp(-(dx * dx + dy * dy) / sS2);
+      sp[(dy + r) * 3 + (dx + r)] = Math.exp(-(dx * dx + dy * dy) / sS2);
+  const rangeLUT = getRangeLUT(sigmaR);
+
+  const sp0 = sp[0], sp1 = sp[1], sp2 = sp[2];
+  const sp3 = sp[3], sp4 = sp[4], sp5 = sp[5];
+  const sp6 = sp[6], sp7 = sp[7], sp8 = sp[8];
 
   for (let y = 0; y < h; y++) {
+    const r0 = (y - 1 < 0 ? 0 : y - 1) * w;
+    const r1 = y * w;
+    const r2 = (y + 1 >= h ? h - 1 : y + 1) * w;
     for (let x = 0; x < w; x++) {
-      const idx = y * w + x;
+      const idx = r1 + x;
       const cv = Y[idx];
-      let sum = 0, wsum = 0;
-      for (let dy = -r; dy <= r; dy++) {
-        const yy = y + dy;
-        if (yy < 0 || yy >= h) continue;
-        for (let dx = -r; dx <= r; dx++) {
-          const xx = x + dx;
-          if (xx < 0 || xx >= w) continue;
-          const v = Y[yy * w + xx];
-          const dv = v - cv;
-          const wv = sp[(dy + r) * (r * 2 + 1) + (dx + r)] * Math.exp(-(dv * dv) / sR2);
-          sum += v * wv; wsum += wv;
-        }
-      }
-      out[idx] = sum / wsum;
+      const xL = x - 1 < 0 ? 0 : x - 1;
+      const xR = x + 1 >= w ? w - 1 : x + 1;
+
+      const v0 = Y[r0 + xL], v1 = Y[r0 + x], v2 = Y[r0 + xR];
+      const v3 = Y[r1 + xL],               v5 = Y[r1 + xR];
+      const v6 = Y[r2 + xL], v7 = Y[r2 + x], v8 = Y[r2 + xR];
+
+      let d;
+      d = v0 - cv; if (d < 0) d = -d; const w0 = sp0 * (d < 512 ? rangeLUT[d | 0] : 0);
+      d = v1 - cv; if (d < 0) d = -d; const w1 = sp1 * (d < 512 ? rangeLUT[d | 0] : 0);
+      d = v2 - cv; if (d < 0) d = -d; const w2 = sp2 * (d < 512 ? rangeLUT[d | 0] : 0);
+      d = v3 - cv; if (d < 0) d = -d; const w3 = sp3 * (d < 512 ? rangeLUT[d | 0] : 0);
+      const w4 = sp4; // center, dv=0 → range weight = 1
+      d = v5 - cv; if (d < 0) d = -d; const w5 = sp5 * (d < 512 ? rangeLUT[d | 0] : 0);
+      d = v6 - cv; if (d < 0) d = -d; const w6 = sp6 * (d < 512 ? rangeLUT[d | 0] : 0);
+      d = v7 - cv; if (d < 0) d = -d; const w7 = sp7 * (d < 512 ? rangeLUT[d | 0] : 0);
+      d = v8 - cv; if (d < 0) d = -d; const w8 = sp8 * (d < 512 ? rangeLUT[d | 0] : 0);
+
+      const wsum = w0 + w1 + w2 + w3 + w4 + w5 + w6 + w7 + w8;
+      const sum = v0 * w0 + v1 * w1 + v2 * w2 + v3 * w3 + cv * w4 + v5 * w5 + v6 * w6 + v7 * w7 + v8 * w8;
+      out[idx] = wsum > 0 ? sum / wsum : cv;
     }
   }
   return out;
@@ -266,31 +292,51 @@ export function claheY(Y: Float32Array, w: number, h: number, blend: number, cli
   }
 }
 
-// ---------- separable gaussian (for clarity) ----------
-function gauss1D(src: Float32Array, w: number, h: number, radius: number): Float32Array {
+// ---------- separable gaussian with kernel cache ----------
+const _kernelCache = new Map<string, { r: number; k: Float32Array }>();
+function gaussKernel(radius: number) {
+  const key = radius.toFixed(3);
+  const hit = _kernelCache.get(key);
+  if (hit) return hit;
   const r = Math.max(1, Math.round(radius * 2));
   const sigma = Math.max(0.5, radius);
   const k = new Float32Array(r * 2 + 1);
   let s = 0;
   for (let i = -r; i <= r; i++) { const v = Math.exp(-(i * i) / (2 * sigma * sigma)); k[i + r] = v; s += v; }
   for (let i = 0; i < k.length; i++) k[i] /= s;
+  const entry = { r, k };
+  _kernelCache.set(key, entry);
+  return entry;
+}
+
+function gauss1D(src: Float32Array, w: number, h: number, radius: number): Float32Array {
+  const { r, k } = gaussKernel(radius);
   const tmp = new Float32Array(src.length);
   const out = new Float32Array(src.length);
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    let acc = 0;
-    for (let i = -r; i <= r; i++) {
-      let xx = x + i; if (xx < 0) xx = 0; else if (xx >= w) xx = w - 1;
-      acc += src[y * w + xx] * k[i + r];
+  // horizontal
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    for (let x = 0; x < w; x++) {
+      let acc = 0;
+      for (let i = -r; i <= r; i++) {
+        let xx = x + i;
+        if (xx < 0) xx = 0; else if (xx >= w) xx = w - 1;
+        acc += src[row + xx] * k[i + r];
+      }
+      tmp[row + x] = acc;
     }
-    tmp[y * w + x] = acc;
   }
-  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
-    let acc = 0;
-    for (let i = -r; i <= r; i++) {
-      let yy = y + i; if (yy < 0) yy = 0; else if (yy >= h) yy = h - 1;
-      acc += tmp[yy * w + x] * k[i + r];
+  // vertical
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      let acc = 0;
+      for (let i = -r; i <= r; i++) {
+        let yy = y + i;
+        if (yy < 0) yy = 0; else if (yy >= h) yy = h - 1;
+        acc += tmp[yy * w + x] * k[i + r];
+      }
+      out[y * w + x] = acc;
     }
-    out[y * w + x] = acc;
   }
   return out;
 }

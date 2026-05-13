@@ -58,6 +58,8 @@ export default function Page() {
   const [aiBusy, setAiBusy] = useState(false);
   const [aiStage, setAiStage] = useState<string>("");
   const [aiPct, setAiPct] = useState<number>(0);
+  const [aiError, setAiError] = useState<string>("");
+  const [aiElapsed, setAiElapsed] = useState<number>(0);
   const [beforeData, setBeforeData] = useState<ImageData | null>(null);
   const [afterData, setAfterData] = useState<ImageData | null>(null);
   const [showCompare, setShowCompare] = useState(false);
@@ -113,7 +115,11 @@ export default function Page() {
 
   const runAi = async () => {
     if (!originalRef.current) return;
-    setAiBusy(true); setAiPct(0); setAiStage("hazırlanıyor");
+    setAiBusy(true); setAiPct(0); setAiStage("başlatılıyor"); setAiError("");
+    const t0 = performance.now();
+    const elapsedTimer = window.setInterval(() => {
+      setAiElapsed(Math.round((performance.now() - t0) / 1000));
+    }, 250);
     try {
       let result: ImageData;
       if (mode === "neural") {
@@ -138,9 +144,12 @@ export default function Page() {
       cnv.getContext("2d")!.putImageData(result, 0, 0);
       setAiPct(100); setAiStage("bitti");
     } catch (e: any) {
-      console.error(e);
-      setAiStage("hata: " + (e?.message || "bilinmeyen"));
+      console.error("[runAi] failed:", e);
+      const msg = e?.message || e?.toString() || "bilinmeyen hata";
+      setAiStage("HATA");
+      setAiError(msg);
     } finally {
+      window.clearInterval(elapsedTimer);
       setAiBusy(false);
     }
   };
@@ -207,6 +216,22 @@ export default function Page() {
         />
         {hasImage && showCompare && beforeData && afterData && (
           <CompareSlider beforeData={beforeData} afterData={afterData} />
+        )}
+        {aiBusy && (
+          <div className="aiOverlay">
+            <div className="spinner" />
+            <div className="overlayStage">{aiStage}</div>
+            <div className="overlayPct">%{aiPct}</div>
+            <div className="overlayBar"><div style={{ width: `${aiPct}%` }} /></div>
+            <div className="overlayMeta">{aiElapsed}s geçti · konsol (F12) detay</div>
+          </div>
+        )}
+        {!aiBusy && aiError && (
+          <div className="aiError">
+            <div><strong>Hata</strong></div>
+            <div className="errMsg">{aiError}</div>
+            <button onClick={() => setAiError("")}>Kapat</button>
+          </div>
         )}
       </div>
 

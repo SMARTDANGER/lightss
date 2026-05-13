@@ -44,24 +44,24 @@ let _trans: any = null;
 const _pipes = new Map<NeuralModelId, any>();
 const _loading = new Map<NeuralModelId, Promise<any>>();
 
-// CDN URL of @huggingface/transformers ESM build. Loaded at runtime by browser
-// (NOT bundled by webpack) so we can use a heavy ONNX runtime without bloating
-// the Vercel deploy. webpackIgnore tells Next/webpack to leave this import alone.
-const TRANSFORMERS_CDN = "https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.0.2";
+// CDN URL of @huggingface/transformers ESM build. esm.sh rewrites all internal
+// imports to resolvable URLs so native browser dynamic import works.
+// webpackIgnore tells Next/webpack to leave this import alone.
+const TRANSFORMERS_CDN = "https://esm.sh/@huggingface/transformers@3.0.2";
 
-async function loadTransformers() {
+async function loadTransformers(onLog?: (msg: string) => void) {
   if (_trans) return _trans;
+  onLog?.("CDN fetch (esm.sh transformers.js)…");
+  console.log("[neural] importing transformers.js from", TRANSFORMERS_CDN);
   // @ts-ignore — runtime ESM fetch from CDN
   _trans = await import(/* webpackIgnore: true */ TRANSFORMERS_CDN);
+  console.log("[neural] transformers loaded:", Object.keys(_trans));
   _trans.env.allowLocalModels = false;
   _trans.env.allowRemoteModels = true;
-  // Off-main-thread inference so UI never freezes.
-  // proxy: run ONNX session in a dedicated Web Worker.
-  // numThreads=1 avoids SharedArrayBuffer requirement (no COOP/COEP needed on Vercel).
   try {
     _trans.env.backends.onnx.wasm.proxy = true;
     _trans.env.backends.onnx.wasm.numThreads = 1;
-  } catch {}
+  } catch (e) { console.warn("[neural] wasm env setup warn:", e); }
   return _trans;
 }
 
@@ -70,20 +70,37 @@ function pickDevice(): "webgpu" | "wasm" {
   return "wasm";
 }
 
-export async function getNeuralPipe(modelId: NeuralModelId, onProg?: (pct: number) => void) {
+export async function getNeuralPipe(
+  modelId: NeuralModelId,
+  onProg?: (stage: string, pct: number) => void
+) {
   const cached = _pipes.get(modelId);
-  if (cached) return cached;
+  if (cached) { console.log("[neural] pipe cached:", modelId); return cached; }
   const loading = _loading.get(modelId);
-  if (loading) return loading;
+  if (loading) { console.log("[neural] pipe already loading:", modelId); return loading; }
 
   const p = (async () => {
-    const t = await loadTransformers();
+    const t = await loadTransformers((m) => onProg?.(m, 2));
     const device = pickDevice();
+    console.log("[neural] device:", device, "model:", modelId);
+    onProg?.(`pipeline init (${device})`, 5);
+
     const baseOpts: any = {
       progress_callback: (info: any) => {
-        if (info.status === "progress" && info.total) {
+        if (info.status === "download") {
+          console.log("[neural] download start:", info.file);
+          onProg?.(`indiriliyor: ${info.file ?? "model"}`, 8);
+        } else if (info.status === "progress" && info.total) {
           const pct = (info.loaded / info.total) * 100;
-          onProg?.(Math.max(0, Math.min(100, pct)));
+          const mb = (info.loaded / (1024 * 1024)).toFixed(1);
+          const tot = (info.total / (1024 * 1024)).toFixed(1);
+          onProg?.(`indiriliyor: ${info.file ?? "model"} ${mb}/${tot}MB`, 8 + pct * 0.4);
+        } else if (info.status === "done") {
+          console.log("[neural] download done:", info.file);
+          onProg?.("model derleniyor (ONNX session)", 50);
+        } else if (info.status === "ready") {
+          console.log("[neural] pipeline ready");
+          onProg?.("hazır", 55);
         }
       },
     };
@@ -95,10 +112,11 @@ export async function getNeuralPipe(modelId: NeuralModelId, onProg?: (pct: numbe
         dtype: device === "webgpu" ? "fp16" : "fp32",
       });
     } catch (err) {
-      // fallback to wasm if webgpu init failed
-      console.warn("[neural] webgpu failed, fallback to wasm", err);
+      console.warn("[neural] device init failed, fallback to wasm", err);
+      onProg?.("wasm fallback", 30);
       pipe = await t.pipeline("image-to-image", modelId, baseOpts);
     }
+    console.log("[neural] pipe created");
     _pipes.set(modelId, pipe);
     _loading.delete(modelId);
     return pipe;
@@ -221,12 +239,11 @@ export async function neuralEnhance(
 ): Promise<ImageData> {
   const model = NEURAL_MODELS.find((m) => m.id === opts.modelId) ?? NEURAL_MODELS[0];
 
-  onProg?.("model indiriliyor", 0);
-  const t = await loadTransformers();
-  const pipe = await getNeuralPipe(opts.modelId, (p) =>
-    onProg?.("model indiriliyor", p * 0.5)
-  );
-  onProg?.("hazırlanıyor", 52);
+  console.log("[neural] start, model:", model.id, "src:", src.width, "x", src.height);
+  onProg?.("başlatılıyor", 1);
+  const t = await loadTransformers((m) => onProg?.(m, 2));
+  const pipe = await getNeuralPipe(opts.modelId, (stage, pct) => onProg?.(stage, pct));
+  onProg?.("girdi hazırlanıyor", 56);
 
   // optional downscale to cap memory
   let working = src;
@@ -240,9 +257,15 @@ export async function neuralEnhance(
   const scale = model.scale;
 
   if (opts.tileSize <= 0 || (sw <= opts.tileSize && sh <= opts.tileSize)) {
-    onProg?.("neural çıkarım", 70);
+    console.log("[neural] single-pass inference", sw, "x", sh);
+    onProg?.(`neural çıkarım ${sw}×${sh}`, 60);
+    await new Promise((r) => setTimeout(r, 0));
     const tileImg = imageDataToRaw(working, t.RawImage);
+    onProg?.("model çalışıyor…", 65);
+    const t0 = performance.now();
     const result = await pipe(tileImg);
+    console.log("[neural] inference done in", ((performance.now() - t0) / 1000).toFixed(1), "s");
+    onProg?.("sonuç işleniyor", 96);
     onProg?.("bitti", 100);
     return rawToImageData(Array.isArray(result) ? result[0] : result);
   }
