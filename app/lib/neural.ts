@@ -48,11 +48,19 @@ async function loadTransformers(onLog?: (msg: string) => void) {
   console.log("[neural] transformers loaded");
   _trans.env.allowLocalModels = false;
   _trans.env.allowRemoteModels = true;
-  // wasm-only. Run ONNX session in a Web Worker (proxy) so UI doesn't freeze.
-  // WebGPU disabled because Swin2SR ops have spotty WebGPU support across browsers.
+
+  // Explicit WASM file paths. esm.sh doesn't reliably serve the `.wasm` binaries
+  // that ort.webgpu.bundle.min.mjs expects at runtime, so point at jsdelivr's
+  // raw npm files. Version must match transformers.js@3.0.2's pinned onnxruntime-web.
+  const ORT_VERSION = "1.20.0";
+  const ORT_WASM_BASE = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/`;
   try {
-    _trans.env.backends.onnx.wasm.proxy = true;
+    _trans.env.backends.onnx.wasm.wasmPaths = ORT_WASM_BASE;
     _trans.env.backends.onnx.wasm.numThreads = 1;
+    // proxy=false: run wasm on main thread. Proxy worker had its own WASM path
+    // resolution failures on the prior deploy. Single-thread main is reliable.
+    _trans.env.backends.onnx.wasm.proxy = false;
+    console.log("[neural] wasm env configured, wasmPaths:", ORT_WASM_BASE);
   } catch (e) { console.warn("[neural] wasm env setup warn:", e); }
   return _trans;
 }
