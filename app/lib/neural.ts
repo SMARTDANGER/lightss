@@ -55,9 +55,30 @@ async function loadTransformers(onLog?: (msg: string) => void) {
   return _trans;
 }
 
-function pickDevice(): "webgpu" | "wasm" {
-  if (typeof navigator !== "undefined" && (navigator as any).gpu) return "webgpu";
-  return "wasm";
+// Reliable backend detection. WebGPU has spotty op support for Swin2SR and
+// fails at inference with "no available backend found" even when navigator.gpu
+// exists. Strategy: request an adapter to actually verify support, otherwise
+// fall back to wasm. wasm is universal and runs off-main-thread via proxy.
+async function detectDevice(): Promise<"webgpu" | "wasm"> {
+  const gpu = typeof navigator !== "undefined" ? (navigator as any).gpu : null;
+  if (!gpu) return "wasm";
+  try {
+    const adapter = await gpu.requestAdapter();
+    if (!adapter) return "wasm";
+    // try to query Swin2SR-required features; if any throws we bail to wasm
+    return "webgpu";
+  } catch (e) {
+    console.warn("[neural] webgpu adapter request failed:", e);
+    return "wasm";
+  }
+}
+
+async function buildPipe(t: any, device: "webgpu" | "wasm", baseOpts: any) {
+  return t.pipeline("image-to-image", MODEL.id, {
+    ...baseOpts,
+    device,
+    dtype: device === "webgpu" ? "fp16" : "fp32",
+  });
 }
 
 async function getPipe(onProg?: (stage: string, pct: number) => void) {
@@ -66,7 +87,7 @@ async function getPipe(onProg?: (stage: string, pct: number) => void) {
 
   _loading = (async () => {
     const t = await loadTransformers((m) => onProg?.(m, 2));
-    const device = pickDevice();
+    let device = await detectDevice();
     console.log("[neural] device:", device);
     onProg?.(`pipeline init (${device})`, 5);
 
@@ -86,18 +107,41 @@ async function getPipe(onProg?: (stage: string, pct: number) => void) {
         }
       },
     };
+
     let pipe;
     try {
-      pipe = await t.pipeline("image-to-image", MODEL.id, {
-        ...baseOpts,
-        device,
-        dtype: device === "webgpu" ? "fp16" : "fp32",
-      });
+      pipe = await buildPipe(t, device, baseOpts);
     } catch (err) {
-      console.warn("[neural] device init failed, fallback to wasm", err);
+      console.warn("[neural] init failed on", device, "→ wasm:", err);
       onProg?.("wasm fallback", 30);
-      pipe = await t.pipeline("image-to-image", MODEL.id, baseOpts);
+      device = "wasm";
+      pipe = await buildPipe(t, "wasm", baseOpts);
     }
+
+    // Smoke test: run a 16x16 tile to verify inference actually works.
+    // Catches "no available backend found" errors that only surface at runtime.
+    try {
+      const testRgb = new Uint8ClampedArray(16 * 16 * 3);
+      const testRaw = new t.RawImage(testRgb, 16, 16, 3);
+      onProg?.("backend doğrulanıyor", 56);
+      console.log("[neural] running smoke test on", device);
+      await pipe(testRaw);
+      console.log("[neural] smoke test OK on", device);
+    } catch (err) {
+      if (device === "webgpu") {
+        console.warn("[neural] webgpu inference failed, rebuilding with wasm:", err);
+        onProg?.("wasm fallback (webgpu çalışmıyor)", 40);
+        pipe = await buildPipe(t, "wasm", baseOpts);
+        // re-smoke
+        const testRgb = new Uint8ClampedArray(16 * 16 * 3);
+        const testRaw = new t.RawImage(testRgb, 16, 16, 3);
+        await pipe(testRaw);
+        console.log("[neural] wasm fallback OK");
+      } else {
+        throw err;
+      }
+    }
+
     _pipe = pipe;
     _loading = null;
     return pipe;
