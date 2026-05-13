@@ -4,7 +4,7 @@
 // All metrics computed on a downscaled Y-channel sample for speed (< 5ms typically).
 
 import type { AiOpts } from "./ai";
-import type { NeuralOpts, NeuralModelId } from "./neural";
+import type { NeuralOpts } from "./neural";
 
 export type ImageStats = {
   width: number;
@@ -181,31 +181,21 @@ export function autoTuneNeural(stats: ImageStats): NeuralOpts {
   const long = stats.longSide;
   const hasWebGPU = typeof navigator !== "undefined" && !!(navigator as any).gpu;
 
-  // model selection by size
-  let modelId: NeuralModelId;
-  if (long <= 400) {
-    // tiny → use strongest 4x to gain real resolution
-    modelId = "Xenova/swin2SR-realworld-sr-x4-64-bsrgan-psnr";
-  } else if (long <= 900) {
-    // medium → classic 2x is sweet spot
-    modelId = "Xenova/swin2SR-classical-sr-x2-64";
-  } else {
-    // big → classic 2x with downscale (no need for 4x output)
-    modelId = "Xenova/swin2SR-classical-sr-x2-64";
-  }
-
-  // max input cap
+  // model is fixed (Swin2SR real-world 4x). Tune only inference params.
+  // maxInput: smaller for wasm to fit RAM, bigger for WebGPU.
   let maxInput: number;
-  if (hasWebGPU) {
-    maxInput = Math.min(long, long <= 400 ? long : 1024);
-  } else {
-    maxInput = Math.min(long, long <= 400 ? long : 512);
-  }
+  if (hasWebGPU) maxInput = Math.min(long, 768);
+  else           maxInput = Math.min(long, 384);
 
-  // tile size: smaller for low memory, larger for fewer passes
-  // 0 = no tiling for tiny images
   const tileSize = long <= 256 ? 0 : hasWebGPU ? 192 : 128;
   const overlap = tileSize > 0 ? Math.max(8, Math.round(tileSize * 0.12)) : 0;
 
-  return { modelId, maxInput, tileSize, overlap };
+  return {
+    faceGlow: true,
+    autoColor: true,
+    hiDetail: true,
+    maxInput,
+    tileSize,
+    overlap,
+  };
 }
