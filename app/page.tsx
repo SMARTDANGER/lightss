@@ -9,6 +9,7 @@ import {
   NeuralOpts,
   NeuralModelId,
 } from "./lib/neural";
+import { analyzeImage, autoTuneAi, autoTuneNeural, ImageStats } from "./lib/analyze";
 import CompareSlider from "./components/CompareSlider";
 
 type Range = { key: keyof Settings; label: string; min: number; max: number; step: number };
@@ -60,6 +61,8 @@ export default function Page() {
   const [aiPct, setAiPct] = useState<number>(0);
   const [aiError, setAiError] = useState<string>("");
   const [aiElapsed, setAiElapsed] = useState<number>(0);
+  const [stats, setStats] = useState<ImageStats | null>(null);
+  const [autoTune, setAutoTune] = useState(true);
   const [beforeData, setBeforeData] = useState<ImageData | null>(null);
   const [afterData, setAfterData] = useState<ImageData | null>(null);
   const [showCompare, setShowCompare] = useState(false);
@@ -91,10 +94,31 @@ export default function Page() {
       originalRef.current = new ImageData(new Uint8ClampedArray(id.data), w, h);
       const out = canvasRef.current!;
       out.width = w; out.height = h;
+      // analyze + auto-tune
+      try {
+        const t0 = performance.now();
+        const s = analyzeImage(id);
+        console.log("[analyze] in", (performance.now() - t0).toFixed(1), "ms", s);
+        setStats(s);
+        if (autoTune) {
+          setAiOpts(autoTuneAi(s));
+          setNeuralOpts(autoTuneNeural(s));
+        }
+      } catch (err) {
+        console.warn("[analyze] failed", err);
+      }
       setHasImage(true);
     };
     img.src = URL.createObjectURL(file);
-  }, []);
+  }, [autoTune]);
+
+  const reTune = () => {
+    if (!originalRef.current) return;
+    const s = analyzeImage(originalRef.current);
+    setStats(s);
+    setAiOpts(autoTuneAi(s));
+    setNeuralOpts(autoTuneNeural(s));
+  };
 
   const schedule = useCallback(() => {
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
@@ -252,6 +276,31 @@ export default function Page() {
           <button onClick={reset} disabled={!hasImage}>Sıfırla</button>
           <button className="primary" onClick={download} disabled={!hasImage}>İndir PNG</button>
         </div>
+
+        {stats && (
+          <div className="stats">
+            <div className="statsHead">
+              <span>📊 Otomatik analiz</span>
+              <button className="reTune" onClick={reTune} disabled={!hasImage}>Yeniden ayarla</button>
+            </div>
+            <div className="statsGrid">
+              <div><span>Boyut</span><b>{stats.width}×{stats.height}</b></div>
+              <div><span>Bulanıklık</span><b className={stats.blurScore > 0.5 ? "bad" : stats.blurScore > 0.2 ? "med" : "good"}>
+                {(stats.blurScore * 100).toFixed(0)}% (L={stats.laplacianVar.toFixed(0)})
+              </b></div>
+              <div><span>Gürültü</span><b className={stats.noiseScore > 0.5 ? "bad" : stats.noiseScore > 0.2 ? "med" : "good"}>
+                {(stats.noiseScore * 100).toFixed(0)}%
+              </b></div>
+              <div><span>Parlaklık</span><b>{stats.meanLum.toFixed(0)}/255</b></div>
+              <div><span>Kontrast</span><b>{stats.stdLum.toFixed(0)}</b></div>
+              <div><span>Karanlık</span><b>{(stats.darkFrac * 100).toFixed(0)}%</b></div>
+            </div>
+            <label className="check">
+              <input type="checkbox" checked={autoTune} onChange={(e) => setAutoTune(e.target.checked)} />
+              <span>Yeni resimde otomatik ayarla</span>
+            </label>
+          </div>
+        )}
 
         <div className="modeTabs">
           <button

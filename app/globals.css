@@ -283,3 +283,41 @@ button:disabled { opacity: .5; cursor: not-allowed; }
   background: #5a2030;
   border-color: #7a3040;
 }
+
+/* ---------- auto stats ---------- */
+.stats {
+  background: linear-gradient(135deg, rgba(106,92,255,.08), rgba(0,194,255,.04));
+  border: 1px solid #2a2a36;
+  border-radius: 10px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.statsHead {
+  display: flex; justify-content: space-between; align-items: center;
+  font-size: 12px; color: #c8c8d6; font-weight: 600;
+}
+.statsHead .reTune {
+  font-size: 11px;
+  padding: 4px 10px;
+  background: #1f1f2a;
+  border: 1px solid #3a3a48;
+}
+.statsGrid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 12px;
+}
+.statsGrid > div {
+  display: flex; justify-content: space-between;
+  font-size: 11px;
+  border-bottom: 1px dashed #25252f;
+  padding: 3px 0;
+}
+.statsGrid > div span { color: #8a8a99; }
+.statsGrid > div b { color: #e8e8ee; font-weight: 600; }
+.statsGrid b.good { color: #7fdc8b; }
+.statsGrid b.med  { color: #f0c060; }
+.statsGrid b.bad  { color: #ff7888; }
+.stats .check { font-size: 11px; color: #a8a8b8; }
